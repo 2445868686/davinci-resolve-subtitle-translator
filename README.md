@@ -1,0 +1,1 @@
+# davinci-resolve-subtitle-translator
