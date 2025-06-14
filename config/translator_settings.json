@@ -1,6 +1,6 @@
 {
-    "CN": true,
-    "EN": false,
+    "CN": false,
+    "EN": true,
     "PROVIDER": 0,
     "AZURE_API_KEY": "",
     "AZURE_REGION": "",

@@ -617,21 +617,27 @@ def frame_to_timecode(frame, fps):
 
 def write_srt(subs, start_frame, fps, timeline_name, lang_code, output_dir="."):
     """
-    按 [时间线名称]_[语言code]_[版本].srt 规则写文件：
+    按 [时间线名称]_[语言code]_[4位随机码]_[版本].srt 规则写文件：
       1. 安全化时间线名称和语言code
-      2. 扫描已有文件，计算新版本号
-      3. 保证 output_dir 存在
+      2. 添加4位随机码
+      3. 扫描已有文件，计算新版本号
       4. 写入并返回路径
     """
     # 1. 安全化名称
     safe_name = re.sub(r'[\\\/:*?"<>|]', "_", timeline_name)
     safe_lang = re.sub(r'[\\\/:*?"<>|]', "_", lang_code)
+    import random
+    import string
+    # 2. 生成4位随机字母+数字码
+    rand_code = ''.join(random.choices(string.ascii_lowercase + string.digits, k=4))
 
-    # 2. 创建目录（若不存在）
+    # 3. 创建目录（若不存在）
     os.makedirs(output_dir, exist_ok=True)
 
-    # 3. 扫描已有版本
-    pattern = re.compile(rf"^{re.escape(safe_name)}_{re.escape(safe_lang)}_(\d+)\.srt$")
+    # 4. 扫描已有版本
+    pattern = re.compile(
+        rf"^{re.escape(safe_name)}_{re.escape(safe_lang)}_{re.escape(rand_code)}_(\d+)\.srt$"
+    )
     versions = []
     for fname in os.listdir(output_dir):
         m = pattern.match(fname)
@@ -639,17 +645,17 @@ def write_srt(subs, start_frame, fps, timeline_name, lang_code, output_dir="."):
             versions.append(int(m.group(1)))
     version = max(versions) + 1 if versions else 1
 
-    # 4. 构造文件名与路径
-    filename = f"{safe_name}_{safe_lang}_{version}.srt"
+    # 5. 构造文件名与路径
+    filename = f"{safe_name}_{safe_lang}_{rand_code}_{version}.srt"
     path = os.path.join(output_dir, filename)
 
-    # 5. 写入 SRT 内容
+    # 6. 写入 SRT 内容
     with open(path, "w", encoding="utf-8") as f:
         for idx, s in enumerate(subs, 1):
             f.write(
                 f"{idx}\n"
-                f"{frame_to_timecode(s['start']-start_frame, fps)} --> "
-                f"{frame_to_timecode(s['end']  -start_frame, fps)}\n"
+                f"{frame_to_timecode(s['start'] - start_frame, fps)} --> "
+                f"{frame_to_timecode(s['end'] - start_frame, fps)}\n"
                 f"{s['text']}\n\n"
             )
 
@@ -678,14 +684,36 @@ def import_srt_to_first_empty(path):
     return True
 
 # =============== 6  并发翻译封装 ===============
-def translate_parallel(text_list, provider, target_lang):
-    """provider 为 BaseProvider 子类实例"""
+def translate_parallel(text_list, provider, lang_for_provider, status_label=None):
+    """
+    并发翻译封装，支持不同服务商调用，以及可选的状态回调
+    :param text_list: 待翻译文本列表
+    :param provider: BaseProvider 子类实例
+    :param lang_for_provider: 传入 provider.translate 的语言参数，如自然语言名称或语言代码
+    :param status_label: 可选的 GUI 状态标签控件，用于实时更新进度
+    :return: 翻译后文本列表
+    """
+    total = len(text_list)
+    result = [None] * total
+    completed = 0
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
-        futures = {pool.submit(provider.translate, t, target_lang): i
-                   for i,t in enumerate(text_list)}
-        result  = [None]*len(text_list)
+        # 提交任务，动态传入 lang_for_provider
+        futures = {pool.submit(provider.translate, t, lang_for_provider): idx
+                   for idx, t in enumerate(text_list)}
+
         for f in concurrent.futures.as_completed(futures):
-            idx = futures[f]; result[idx] = f.result()
+            idx = futures[f]
+            try:
+                result[idx] = f.result()
+            except Exception as e:
+                result[idx] = f"[失败: {e}]"
+            finally:
+                completed += 1
+                if status_label:
+                    pct = int(completed / total * 100)
+                    status_label.Text = f"翻译中… {pct}% ({completed}/{total})"
+
     return result
 
 # =============== 7  主按钮逻辑 ===============
@@ -705,29 +733,42 @@ def on_trans_clicked(ev):
     provider_name = items["ProviderCombo"].CurrentText
     provider      = prov_manager.get(provider_name)
     target_lang_name = items["TargetLangCombo"].CurrentText        # 例：中文（普通话）
-    target_lang_code = LANG_CODE_MAP[target_lang_name]             # 例：zh-Hans
-
 
     # 如果用户在 GUI 修改了 key/url/model，则写回 provider.cfg
+    lang_for_provider = None
     if provider_name == "openai":
-        # 与原逻辑一致
         provider.cfg["api_key"]  = openai_items["OpenAIApiKey"].Text or provider.cfg["api_key"]
         provider.cfg["base_url"] = openai_items["OpenAIBaseURL"].Text or provider.cfg["base_url"]
         provider.cfg["model"]    = openai_items["OpenAIModelCombo"].CurrentText or provider.cfg["model"]
-        lang_for_provider = target_lang_name             # OpenAI 使用自然语言名称
+        # OpenAI uses the full language name in its prompt
+        lang_for_provider = target_lang_name
+
     elif provider_name == "azure":
-        provider.cfg["api_key"]  = azure_items["AzureApiKey"].Text or AZURE_DEFAULT_KEY
-        provider.cfg["region"]   = azure_items["AzureRegion"].Text or AZURE_DEFAULT_REGION
-        lang_for_provider = LANG_CODE_MAP[target_lang_name]  # Azure 用 zh-Hans / en 等
+        provider.cfg["api_key"] = azure_items["AzureApiKey"].Text or AZURE_DEFAULT_KEY
+        provider.cfg["region"]  = azure_items["AzureRegion"].Text or AZURE_DEFAULT_REGION
+        # Azure uses codes like "zh-Hans"
+        lang_for_provider = LANG_CODE_MAP.get(target_lang_name)
+
     elif provider_name == "google":
-        lang_for_provider = GOOGLE_LANG_CODE_MAP[target_lang_name]  # Google 用 zh-cn / en 等
+        # Google uses codes like "zh-cn"
+        lang_for_provider = GOOGLE_LANG_CODE_MAP.get(target_lang_name)
+
     else:
-        raise ValueError(f"未知服务商: {provider_name}")
+        items["StatusLabel"].Text = f"Error: Unknown provider '{provider_name}'"
+        print(f"❌ Unknown provider selected: {provider_name}")
+        return # Stop execution if provider is not recognized
 
-    print(f"➡️ 使用 {provider_name} 翻译 {len(subs)} 行…")
-    ori_texts   = [s["text"] for s in subs]
-    trans_texts = translate_parallel(ori_texts, provider, lang_for_provider)
+    total = len(subs)
 
+    # 禁用按钮，避免重复点击
+    items["TransButton"].Enabled = False
+    # 初始化百分比
+    items["StatusLabel"].Text = "翻译中… 0% (0/{})".format(total)
+
+    ori_texts = [s["text"] for s in subs]
+    
+    trans_texts = translate_parallel(ori_texts, provider, lang_for_provider, items["StatusLabel"])
+           
     for s, new in zip(subs, trans_texts):
         s["text"] = new
 
@@ -738,7 +779,7 @@ def on_trans_clicked(ev):
         current_timeline.GetStartFrame(),
         fps,
         current_timeline.GetName(),
-        target_lang_code,  # 你之前得出的 target_lang_code
+        lang_for_provider,  # 你之前得出的 target_lang_code
         output_dir=output_dir
     )
     print("✅ 翻译完成，SRT 路径：", srt_path)
@@ -749,17 +790,26 @@ def on_trans_clicked(ev):
     # 5. 如果成功，就删除本地 .srt
     if succeed:
         try:
-            os.remove(srt_path)
-            print(f"🗑 本地文件已删除：{srt_path}")
+            items["StatusLabel"].Text = "翻译完成！"
         except Exception as e:
-            print("⚠️ 删除本地 SRT 时出错：", e)
-
+            items["StatusLabel"].Text = "翻译失败！"
+            
+    items["TransButton"].Enabled = True
 win.On.TransButton.Clicked = on_trans_clicked
 
 # =============== 8  关闭窗口保存设置 ===============
 def on_close(ev):
+    import shutil
+    output_dir = os.path.join(script_path, 'srt')
+    if os.path.exists(output_dir):
+        try:
+            shutil.rmtree(output_dir)  # ✅ 删除整个文件夹及其中内容
+            print(f"🧹 已删除文件夹：{output_dir}")
+        except Exception as e:
+            print(f"⚠️ 删除文件夹失败：{e}")
     close_and_save(settings_file)
     dispatcher.ExitLoop()
+
 win.On.MyWin.Close = on_close
 
 # =============== 9  运行 GUI ===============
