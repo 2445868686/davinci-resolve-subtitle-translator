@@ -1,7 +1,11 @@
 {
-    "CN": false,
-    "EN": true,
-    "OpenAI_API_KEY": "",
-    "OpenAI_BASE_URL": "",
-    "OpenAI_Model": 0
+    "CN": true,
+    "EN": false,
+    "PROVIDER": 0,
+    "AZURE_API_KEY": "",
+    "AZURE_REGION": "",
+    "OPENAI_API_KEY": "",
+    "OPENAI_BASE_URL": "",
+    "OPENAI_MODEL": 2,
+    "TARGET_LANG": 2
 }
