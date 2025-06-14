@@ -1,136 +1,304 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-读取字幕 → 逐行并发 GPT 翻译 → 生成译文 SRT
+读取字幕 → 逐行并发翻译 → 生成译文 SRT
+现已支持多服务商：OpenAI  /  Azure
 """
+
 # ================= 用户配置 =================
-SCRIPT_NAME = "DaVinci TTS "
-SCRIPT_VERSION = "3.3"
-SCRIPT_AUTHOR = "HEIBA"
-SCREEN_WIDTH = 1920
-SCREEN_HEIGHT = 1080
-WINDOW_WIDTH = 400 
-WINDOW_HEIGHT = 500
+SCRIPT_NAME    = "DaVinci Translator "
+SCRIPT_VERSION = "v0.1"           # ↑ 版本号顺延
+SCRIPT_AUTHOR  = "HEIBA"
+
+# 界面尺寸
+SCREEN_WIDTH, SCREEN_HEIGHT = 1920, 1080
+WINDOW_WIDTH, WINDOW_HEIGHT = 400, 500
 X_CENTER = (SCREEN_WIDTH - WINDOW_WIDTH) // 2
 Y_CENTER = (SCREEN_HEIGHT - WINDOW_HEIGHT) // 2
-SCRIPT_KOFI_URL="https://ko-fi.com/heiba"
-SCRIPT_WX_URL = "https://mp.weixin.qq.com/s?__biz=MzUzMTk2MDU5Nw==&mid=2247484626&idx=1&sn=e5eef7e48fbfbf37f208ed9a26c5475a&chksm=fabbc2a8cdcc4bbefcb7f6c72a3754335c25ec9c3e408553ec81c009531732e82cbab923276c#rd"
-OPENAI_API_KEY = "sk-wLP8n2FczZrYukonSvbozSba4HyV4cBHstEPDACv8aeI6QFH"
-OPENAI_API_URL = "https://yunwu.ai/"
-CONCURRENCY    = 10               # 并发线程数（5~10 较稳）
-MAX_RETRY      = 3               # 单行最多重试次数
-TIMEOUT        = 30              # 单次请求超时（秒）
+
+# 赞助或帮助链接
+SCRIPT_KOFI_URL = "https://ko-fi.com/heiba"
+SCRIPT_WX_URL   = "https://mp.weixin.qq.com/s?__biz=MzUzMTk2MDU5Nw==&mid=2247484626&idx=1&sn=e5eef7e48fbfbf37f208ed9a26c5475a"
+
+# 并发与重试
+CONCURRENCY = 10
+MAX_RETRY   = 3
+TIMEOUT     = 30
+
+# OpenAI 默认信息（可在 GUI 中覆盖）
+OPENAI_DEFAULT_KEY   = ""
+OPENAI_DEFAULT_URL   = ""
+OPENAI_DEFAULT_MODEL = "gpt-4o-mini"
+
+# Azure 默认信息（可在 GUI 中覆盖）
+AZURE_DEFAULT_KEY    = "BhD5f8aAsNRsVdYYschy54sGdVPGqwKEiOsebzZbRS6u5WUqTIl0JQQJ99BFACYeBjFXJ3w3AAAbACOGdZI3"
+AZURE_DEFAULT_REGION = "eastus"
+AZURE_DEFAULT_URL    = "https://api.cognitive.microsofttranslator.com"
+# ===========================================
+#   语言名称 → Azure Translator 代码映射表
+# ===========================================
+LANG_CODE_MAP = {
+    "中文（普通话）": "zh-Hans",
+    "中文（粤语）":   "yue",
+    "English":      "en",
+    "Japanese":     "ja",
+    "Korean":       "ko",
+    "Spanish":      "es",
+    "Portuguese":   "pt",
+    "French":       "fr",
+    "Indonesian":   "id",
+    "German":       "de",
+    "Russian":      "ru",
+    "Italian":      "it",
+    "Arabic":       "ar",
+    "Turkish":      "tr",
+    "Ukrainian":    "uk",
+    "Vietnamese":   "vi",
+    "Dutch":        "nl",
+}
+GOOGLE_LANG_CODE_MAP = {
+    "中文（普通话）": "zh-cn",
+    "中文（粤语）":   "yue",      # google 对粤语支持有限，如失败可改 'zh-tw'
+    "English":      "en",
+    "Japanese":     "ja",
+    "Korean":       "ko",
+    "Spanish":      "es",
+    "Portuguese":   "pt",
+    "French":       "fr",
+    "Indonesian":   "id",
+    "German":       "de",
+    "Russian":      "ru",
+    "Italian":      "it",
+    "Arabic":       "ar",
+    "Turkish":      "tr",
+    "Ukrainian":    "uk",
+    "Vietnamese":   "vi",
+    "Dutch":        "nl",
+}
 # ===========================================
 
-import os, sys, json, time, tempfile, platform, requests, concurrent.futures
+import os, re,sys, json, time, tempfile, platform, requests, concurrent.futures
 from functools import partial
-# 1. 获取脚本所在目录（备用）
+from abc import ABC, abstractmethod
+from googletrans import Translator 
 script_path = os.path.dirname(os.path.abspath(sys.argv[0]))
 config_dir = os.path.join(script_path, 'config')
 settings_file = os.path.join(config_dir, 'translator_settings.json')
 
+# --------- 1  Provider 基类与两家实现 ---------
+class BaseProvider(ABC):
+    """所有翻译服务商抽象基类"""
+    name = "base"
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+    @abstractmethod
+    def translate(self, text: str, target_lang: str) -> str:
+        pass
 
+# ---------- Google 翻译 ----------
+class GoogleProvider(BaseProvider):
+    name = "google"
+
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        self.translator = Translator(
+            service_urls=cfg.get("service_urls", 
+            [
+                "translate.google.com",
+                "translate.google.com.hk",
+                "translate.google.com.tw",
+            ]),
+        )
+
+    def translate(self, text, target_lang):
+        """
+        target_lang 需为 googletrans 语言代码，如 'zh-cn' / 'en'
+        """
+        for attempt in range(1, self.cfg.get("max_retry", 3) + 1):
+            try:
+                res = self.translator.translate(
+                    text, dest=target_lang)       # 不再传 timeout
+                return res.text
+            except Exception as e:
+                if attempt == self.cfg.get("max_retry", 3):
+                    raise
+                time.sleep(2 ** attempt)
+
+                
+# ---------- OpenAI ----------
+class OpenAIProvider(BaseProvider):
+    name = "openai"
+    def translate(self, text, target_lang):
+        payload = {
+            "model": self.cfg["model"],
+            "messages": [
+                {"role": "system",
+                 "content": f"You are a translation engine. "
+                            f"Translate the user message into {target_lang}. "
+                            f"Return ONLY the translated sentence."},
+                {"role": "user", "content": text}
+            ],
+            "temperature": 0
+        }
+        headers = {
+            "Authorization": f"Bearer {self.cfg['api_key']}",
+            "Content-Type":  "application/json"
+        }
+        url = self.cfg["base_url"].rstrip("/") + "/v1/chat/completions"
+
+        for attempt in range(1, self.cfg.get("max_retry", 3)+1):
+            try:
+                r = requests.post(url, headers=headers, json=payload,
+                                  timeout=self.cfg.get("timeout", 30))
+                r.raise_for_status()
+                return r.json()["choices"][0]["message"]["content"].strip()
+            except Exception as e:
+                if attempt == self.cfg.get("max_retry", 3):
+                    raise
+                time.sleep(2 ** attempt)
+
+# ---------- Azure Translator ----------
+class AzureProvider(BaseProvider):
+    name = "azure"
+    def translate(self, text, target_lang):
+        params  = {"api-version": "3.0", "to": target_lang}
+        headers = {
+            "Ocp-Apim-Subscription-Key": self.cfg["api_key"],
+            "Ocp-Apim-Subscription-Region": self.cfg["region"],
+            "Content-Type": "application/json"
+        }
+        url  = self.cfg["base_url"].rstrip("/") + "/translate"
+        body = [{"text": text}]
+
+        for attempt in range(1, self.cfg.get("max_retry", 3)+1):
+            try:
+                r = requests.post(url, params=params, headers=headers,
+                                  json=body, timeout=self.cfg.get("timeout", 15))
+                r.raise_for_status()
+                return r.json()[0]["translations"][0]["text"]
+            except Exception as e:
+                if attempt == self.cfg.get("max_retry", 3):
+                    raise
+                time.sleep(2 ** attempt)
+
+# --------- 2  ProviderManager 单文件实现 ---------
+class ProviderManager:
+    def __init__(self, cfg: dict):
+        self._providers = {}
+        self.default = cfg.get("default")
+        for name, p_cfg in cfg["providers"].items():
+            cls = globals()[p_cfg["class"]]      # 直接从当前模块拿类
+            self._providers[name] = cls(p_cfg)
+    def list(self):            # 返回支持的服务商列表
+        return list(self._providers.keys())
+    def get(self, name=None):  # 获取指定服务商实例
+        return self._providers[name or self.default]
+
+# --------- 3  服务商配置（可在 GUI 动态修改后写回） ---------
+PROVIDERS_CFG = {
+    "default": "google",
+    "providers": {
+        "google": {               # ← 新增
+            "class": "GoogleProvider",
+            "service_urls": ["translate.google.com"],  # 可多填备用域名
+            "max_retry": MAX_RETRY,
+            "timeout": 10
+        },
+        "azure": {
+            "class":  "AzureProvider",
+            "base_url": AZURE_DEFAULT_URL,
+            "api_key":  AZURE_DEFAULT_KEY,
+            "region":   AZURE_DEFAULT_REGION,
+            "max_retry": MAX_RETRY,
+            "timeout":  15
+        },
+        "openai": {
+            "class": "OpenAIProvider",
+            "base_url": OPENAI_DEFAULT_URL,
+            "api_key":  OPENAI_DEFAULT_KEY,
+            "model":    OPENAI_DEFAULT_MODEL,
+            "max_retry": MAX_RETRY,
+            "timeout":  TIMEOUT
+        },
+    }
+}
+
+prov_manager = ProviderManager(PROVIDERS_CFG)   # 实例化
+
+# ================== DaVinci Resolve 接入 ==================
 try:
     import DaVinciResolveScript as dvr_script
     from python_get_resolve import GetResolve
-    print("DaVinciResolveScript from Python")
 except ImportError:
-    
+    # mac / windows 常规路径补全
     if platform.system() == "Darwin": 
-        resolve_script_path1 = "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/Examples"
-        resolve_script_path2 = "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/Modules"
-    elif platform.system() == "Windows": 
-        resolve_script_path1 = os.path.join(os.environ['PROGRAMDATA'], "Blackmagic Design", "DaVinci Resolve", "Support", "Developer", "Scripting", "Examples")
-        resolve_script_path2 = os.path.join(os.environ['PROGRAMDATA'], "Blackmagic Design", "DaVinci Resolve", "Support", "Developer", "Scripting", "Modules")
+        path1 = "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/Examples"
+        path2 = "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/Modules"
+    elif platform.system() == "Windows":
+        path1 = os.path.join(os.environ['PROGRAMDATA'], "Blackmagic Design", "DaVinci Resolve", "Support", "Developer", "Scripting", "Examples")
+        path2 = os.path.join(os.environ['PROGRAMDATA'], "Blackmagic Design", "DaVinci Resolve", "Support", "Developer", "Scripting", "Modules")
     else:
         raise EnvironmentError("Unsupported operating system")
+    sys.path += [path1, path2]
+    import DaVinciResolveScript as dvr_script
+    from python_get_resolve import GetResolve
 
-    sys.path.append(resolve_script_path1)
-    sys.path.append(resolve_script_path2)
-
-    try:
-        import DaVinciResolveScript as dvr_script
-        from python_get_resolve import GetResolve
-        print("DaVinciResolveScript from DaVinci")
-    except ImportError as e:
-        raise ImportError("Unable to import DaVinciResolveScript or python_get_resolve after adding paths") from e
-    
-# 获取Resolve实例
 resolve = GetResolve()
-ui = fusion.UIManager
+ui       = fusion.UIManager
 dispatcher = bmd.UIDispatcher(ui)
 
+# -------------------- 4  GUI 搭建 --------------------
 win = dispatcher.AddWindow(
     {
         "ID": 'MyWin',
-        "WindowTitle": SCRIPT_NAME+SCRIPT_VERSION, 
+        "WindowTitle": SCRIPT_NAME + SCRIPT_VERSION,
         "Geometry": [X_CENTER, Y_CENTER, WINDOW_WIDTH, WINDOW_HEIGHT],
         "Spacing": 10,
-        "StyleSheet": """
-        * {
-            font-size: 14px; /* 全局字体大小 */
-        }
-        """
+        "StyleSheet": "*{font-size:14px;}"
     },
     [
-        ui.VGroup(
-            [
-                ui.TabBar({"Weight": 0.0, "ID": "MyTabs"}),
-                ui.Stack(
-                    {"Weight": 1.0, "ID": "MyStack"},
-                    [
-                        ui.VGroup(
-                            {"Weight": 1},
-                            [
-                                ui.TextEdit({"ID": "SubTxt", "Text": "", "ReadOnly": False, "Font": ui.Font({"PixelSize": 14}),"Weight": 1}),
-                                ui.Label({"ID": 'TrackLabel', "Text": '翻译轨道', "Alignment": {"AlignRight": False}, "Weight": 0.1}),
-                                ui.ComboBox({"ID": 'TrackCombo', "Text": '', "Weight": 0.1}),
-                                ui.Label({"ID": 'OpenAIModelLabel', "Text": '模型', "Alignment": {"AlignRight": False}, "Weight": 0.1}),
-                                ui.ComboBox({"ID": 'OpenAIModelCombo', "Text": '', "Weight": 0.1}),
-                                ui.Label({"ID": 'TargetLangLabel', "Text": '目标语言', "Alignment": {"AlignRight": False}, "Weight": 0.1}),
-                                ui.ComboBox({"ID": 'TargetLangCombo', "Text": '', "Weight": 0.1}),
-                                ui.Button({"ID": 'TransButton', "Text": '翻译',"Weight": 0.1}),
-                                
-                            ]
-                            
-
-                        ),
-                        ui.VGroup(
-                            {"Weight": 1},
-                            [
-                                ui.HGroup({"Weight": 0.1}, [
-                                ui.Label({"Text": "OpenAI API", "Alignment": {"AlignLeft": True}, "Weight": 0.1}),
-                                ui.Button({"ID": "ShowOpenAI", "Text": "配置","Weight": 0.1}),
-                                
-                                ]
-                                ),
-                                ui.HGroup({"Weight": 0.1}, [
-                                ui.CheckBox({"ID": "LangEnCheckBox", "Text": "EN", "Checked": True, "Alignment": {"AlignRight": True}, "Weight": 0}),
-                                ui.CheckBox({"ID": "LangCnCheckBox", "Text": "简体中文", "Checked": False, "Alignment": {"AlignRight": True}, "Weight": 1}),
-                                
-                                ]),
-                                ui.TextEdit({"ID": "infoTxt", "Text": "", "ReadOnly": True, "Font": ui.Font({"PixelSize": 14}),"Weight": 1})
-                            ]
-                            
-                        ),
-                        
-                    ]
-
-                )
-
-            ]
-        )
-            
-    
+        ui.VGroup([
+            ui.TabBar({"ID":"MyTabs","Weight":0.0}),
+            ui.Stack({"ID":"MyStack","Weight":1.0},[
+                # ===== 4.1 翻译页 =====
+                ui.VGroup({"Weight":1},[
+                    ui.TextEdit({"ID":"SubTxt","Text":"","ReadOnly":False,"Weight":1}),
+                    ui.Label({"ID":"TargetLangLabel","Text":"目标语言","Weight":0.1}),
+                    ui.ComboBox({"ID":"TargetLangCombo","Weight":0.1}),
+                    ui.Label({"ID": "StatusLabel", "Text": " ", "Alignment": {"AlignHCenter": True, "AlignVCenter": True},"Weight":0.1}),
+                    ui.Button({"ID":"TransButton","Text":"翻译","Weight":0.1}),
+                ]),
+                # ===== 4.2 配置页 =====
+                ui.VGroup({"Weight":1},[
+                    ui.Label({"ID":"ProviderLabel","Text":"服务商","Weight":0.1}),
+                    ui.ComboBox({"ID":"ProviderCombo","Weight":0.1}),
+                    ui.HGroup({"Weight": 0.1}, [
+                        ui.Label({"Text": "Azure", "Alignment": {"AlignLeft": True}, "Weight": 0.1}),
+                        ui.Button({"ID": "ShowAzure", "Text": "配置","Weight": 0.1,}),
+                    ]),
+                    ui.HGroup({"Weight":0.1},[
+                        ui.Label({"Text":"OpenAI","Weight":0.1}),
+                        ui.Button({"ID":"ShowOpenAI","Text":"配置","Weight":0.1}),
+                    ]),
+                    
+                    ui.HGroup({"Weight":0.1},[
+                        ui.CheckBox({"ID":"LangEnCheckBox","Text":"EN","Checked":True,"Weight":0}),
+                        ui.CheckBox({"ID":"LangCnCheckBox","Text":"简体中文","Checked":False,"Weight":1}),
+                    ]),
+                    ui.TextEdit({"ID":"infoTxt","Text":"","ReadOnly":True,"Weight":1}),
+                ])
+            ])
+        ])
     ]
 )
 
+# --- OpenAI 单独配置窗口（维持原有） ---
 # openai配置窗口
 openai_config_window = dispatcher.AddWindow(
     {
         "ID": "OpenAIConfigWin",
         "WindowTitle": "OpenAI API",
-        "Geometry": [900, 400, 400, 200],
+        "Geometry": [X_CENTER, Y_CENTER, 400, 250],
         "Hidden": True,
         "StyleSheet": """
         * {
@@ -142,18 +310,52 @@ openai_config_window = dispatcher.AddWindow(
         ui.VGroup(
             [
                 ui.Label({"ID": "OpenAILabel","Text": "填写OpenAI API信息", "Alignment": {"AlignHCenter": True, "AlignVCenter": True}}),
-                ui.HGroup({"Weight": 1}, [
-                    ui.Label({"ID": "OpenAIBaseURLLabel", "Text": "Base URL", "Alignment": {"AlignRight": False}, "Weight": 0.2}),
-                    ui.LineEdit({"ID": "OpenAIBaseURL", "Text":"","PlaceholderText": "https://api.openai.com/v1", "Weight": 0.8}),
-                ]),
-                ui.HGroup({"Weight": 1}, [
-                    ui.Label({"ID": "OpenAIApiKeyLabel", "Text": "密钥", "Alignment": {"AlignRight": False}, "Weight": 0.2}),
-                    ui.LineEdit({"ID": "OpenAIApiKey", "Text": "", "EchoMode": "Password", "Weight": 0.8}),
-                    
-                ]),
+
+                ui.Label({"ID": "OpenAIBaseURLLabel", "Text": "Base URL", "Alignment": {"AlignRight": False}, "Weight": 0.2}),
+                ui.LineEdit({"ID": "OpenAIBaseURL", "Text":"","PlaceholderText": "https://api.openai.com/v1", "Weight": 0.8}),
+                ui.Label({"ID": "OpenAIApiKeyLabel", "Text": "密钥", "Alignment": {"AlignRight": False}, "Weight": 0.2}),
+                ui.LineEdit({"ID": "OpenAIApiKey", "Text": "", "EchoMode": "Password", "Weight": 0.8}),
+                ui.Label({"ID":"OpenAIModelLabel","Text":"模型","Weight":0.1}),
+                ui.ComboBox({"ID":"OpenAIModelCombo","Weight":0.1}),   
                 ui.HGroup({"Weight": 1}, [
                     ui.Button({"ID": "OpenAIConfirm", "Text": "确定","Weight": 1}),
                     ui.Button({"ID": "OpenAIRegisterButton", "Text": "注册","Weight": 1}),
+                ]),
+                
+            ]
+        )
+    ]
+)
+
+# azure配置窗口
+azure_config_window = dispatcher.AddWindow(
+    {
+        "ID": "AzureConfigWin",
+        "WindowTitle": "Azure API",
+        "Geometry": [X_CENTER, Y_CENTER, 400, 200],
+        "Hidden": True,
+        "StyleSheet": """
+        * {
+            font-size: 14px; /* 全局字体大小 */
+        }
+    """
+    },
+    [
+        ui.VGroup(
+            [
+                ui.Label({"ID": "AzureLabel","Text": "填写Azure API信息", "Alignment": {"AlignHCenter": True, "AlignVCenter": True}}),
+                ui.HGroup({"Weight": 1}, [
+                    ui.Label({"ID": "AzureRegionLabel", "Text": "区域", "Alignment": {"AlignRight": False}, "Weight": 0.2}),
+                    ui.LineEdit({"ID": "AzureRegion", "Text": "", "Weight": 0.8}),
+                ]),
+                ui.HGroup({"Weight": 1}, [
+                    ui.Label({"ID": "AzureApiKeyLabel", "Text": "密钥", "Alignment": {"AlignRight": False}, "Weight": 0.2}),
+                    ui.LineEdit({"ID": "AzureApiKey", "Text": "", "EchoMode": "Password", "Weight": 0.8}),
+                    
+                ]),
+                ui.HGroup({"Weight": 1}, [
+                    ui.Button({"ID": "AzureConfirm", "Text": "确定","Weight": 1}),
+                    ui.Button({"ID": "AzureRegisterButton", "Text": "注册","Weight": 1}),
                 ]),
                 
             ]
@@ -165,10 +367,15 @@ translations = {
     "cn": {
         "Tabs": ["翻译","配置"],
         "OpenAIModelLabel":"模型：",
-        "TrackLabel":"翻译轨道：",
         "TargetLangLabel":"目标语音：",
         "TransButton":"开始翻译",
+        "ShowAzure":"配置",
         "ShowOpenAI": "配置",
+        "ProviderLabel":"服务商",
+        "AzureRegionLabel":"区域",
+        "AzureApiKeyLabel":"密钥",
+        "AzureConfirm":"确定",
+        "AzureRegisterButton":"注册",
         "OpenAILabel":"填写OpenAI API信息",
         "OpenAIBaseURLLabel":"Base URL",
         "OpenAIApiKeyLabel":"密钥",
@@ -180,10 +387,15 @@ translations = {
     "en": {
         "Tabs": ["Translator", "Configuration"],
         "OpenAIModelLabel":"Model:",
-        "TrackLabel":"Translate Track:",
         "TargetLangLabel":"Target Language:",
         "TransButton":"Translate",
+        "ShowAzure":"Config",
         "ShowOpenAI": "Config",
+        "ProviderLabel":"Provider",
+        "AzureRegionLabel":"Region",
+        "AzureApiKeyLabel":"Key",
+        "AzureConfirm":"OK",
+        "AzureRegisterButton":"Register",
         "OpenAILabel":"OpenAI API",
         "OpenAIBaseURLLabel":"Base URL",
         "OpenAIApiKeyLabel":"Key",
@@ -193,24 +405,22 @@ translations = {
     }
 }    
 
-items = win.GetItems()
+items       = win.GetItems()
 openai_items = openai_config_window.GetItems()
+azure_items = azure_config_window.GetItems()
 items["MyStack"].CurrentIndex = 0
 
+# --- 4.3 初始化下拉内容 ---
 for tab_name in translations["cn"]["Tabs"]:
     items["MyTabs"].AddTab(tab_name)
-    
-def on_my_tabs_current_changed(ev):
-    items["MyStack"].CurrentIndex = ev["Index"]
-win.On.MyTabs.CurrentChanged = on_my_tabs_current_changed
 
-track_counts  = ["1","2","3","4","5"]
-for track in track_counts:
-    items["TrackCombo"].AddItem(track)
+for p in prov_manager.list():
+    items["ProviderCombo"].AddItem(p)
+items["ProviderCombo"].CurrentText = PROVIDERS_CFG["default"]
 
 openai_models = ["gpt-4o-mini","gpt-4o","gpt-4.1-nano","gpt-4.1",]
 for model in openai_models:
-    items["OpenAIModelCombo"].AddItem(model)
+    openai_items["OpenAIModelCombo"].AddItem(model)
 
 target_language = [
     "中文（普通话）", "中文（粤语）", "English", "Japanese", "Korean",
@@ -220,8 +430,7 @@ target_language = [
 
 for lang in target_language:
     items["TargetLangCombo"].AddItem(lang)  
-
-
+    
 def check_or_create_file(file_path):
     if os.path.exists(file_path):
         pass
@@ -251,7 +460,10 @@ def load_settings(settings_file):
     return None
 
 default_settings = {
+    "AZURE_API_KEY":"",
+    "AZURE_REGION":"",
     "OPENAI_API_KEY": "",
+    "PROVIDER":0,
     "OPENAI_BASE_URL": "",
     "OPENAI_MODEL": 0,
     "TARGET_LANG":0,
@@ -261,23 +473,6 @@ default_settings = {
 
 check_or_create_file(settings_file)
 saved_settings = load_settings(settings_file) 
-
-def close_and_save(settings_file):
-    settings = {
-
-        "CN":items["LangCnCheckBox"].Checked,
-        "EN":items["LangEnCheckBox"].Checked,
-        
-        "OPENAI_API_KEY": openai_items["OpenAIApiKey"].Text,
-        "OPENAI_BASE_URL": openai_items["OpenAIBaseURL"].Text,
-        "OPENAI_MODEL": items["OpenAIModelCombo"].CurrentIndex,
-        "TARGET_LANG":items["TargetLangCombo"].CurrentIndex,
-
-
-        
-    }
-
-    save_settings(settings, settings_file)
 
 def switch_language(lang):
     """
@@ -293,6 +488,8 @@ def switch_language(lang):
             continue
         if item_id in items:
             items[item_id].Text = text_value
+        elif item_id in azure_items:    
+            azure_items[item_id].Text = text_value
         elif item_id in openai_items:    
             openai_items[item_id].Text = text_value
         else:
@@ -325,10 +522,11 @@ win.On.LangEnCheckBox.Clicked = on_en_checkbox_clicked
 
 
 if saved_settings:
-    items["OpenAIModelCombo"].CurrentIndex = saved_settings.get("OPENAI_MODEL", default_settings["OPENAI_MODEL"])
+    openai_items["OpenAIModelCombo"].CurrentIndex = saved_settings.get("OPENAI_MODEL", default_settings["OPENAI_MODEL"])
     items["TargetLangCombo"].CurrentIndex = saved_settings.get("TARGET_LANG", default_settings["TARGET_LANG"])
     items["LangCnCheckBox"].Checked = saved_settings.get("CN", default_settings["CN"])
     items["LangEnCheckBox"].Checked = saved_settings.get("EN", default_settings["EN"])
+    items["ProviderCombo"].CurrentIndex = saved_settings.get("PROVIDER", default_settings["PROVIDER"])
     openai_items["OpenAIApiKey"].Text = saved_settings.get("OPENAI_API_KEY", default_settings["OPENAI_API_KEY"])
     openai_items["OpenAIBaseURL"].Text = saved_settings.get("OPENAI_BASE_URL", default_settings["OPENAI_BASE_URL"])    
 
@@ -337,222 +535,236 @@ if items["LangEnCheckBox"].Checked :
 else:
     switch_language("cn")
 
+def close_and_save(settings_file):
+    settings = {
+
+        "CN":items["LangCnCheckBox"].Checked,
+        "EN":items["LangEnCheckBox"].Checked,
+        "PROVIDER":items["ProviderCombo"].CurrentIndex,
+        "AZURE_API_KEY":azure_items["AzureApiKey"].Text,
+        "AZURE_REGION":azure_items["AzureRegion"].Text,
+        
+        "OPENAI_API_KEY": openai_items["OpenAIApiKey"].Text,
+        "OPENAI_BASE_URL": openai_items["OpenAIBaseURL"].Text,
+        "OPENAI_MODEL": openai_items["OpenAIModelCombo"].CurrentIndex,
+        "TARGET_LANG":items["TargetLangCombo"].CurrentIndex,
+
+
+    }
+
+    save_settings(settings, settings_file)
+# --- 4.4 Tab 切换 ---
+def on_my_tabs_current_changed(ev):
+    items["MyStack"].CurrentIndex = ev["Index"]
+win.On.MyTabs.CurrentChanged = on_my_tabs_current_changed
+
+# --- 4.5 打开 OpenAI 配置窗 ---
+def on_show_openai(ev):
+    openai_config_window.Show()
+win.On.ShowOpenAI.Clicked = on_show_openai
+
 def on_openai_close(ev):
     print("OpenAI API 配置完成")
     openai_config_window.Hide()
 openai_config_window.On.OpenAIConfirm.Clicked = on_openai_close
 openai_config_window.On.OpenAIConfigWin.Close = on_openai_close
 
-def on_show_openai(ev):
-    openai_config_window.Show()
-win.On.ShowOpenAI.Clicked = on_show_openai
 
-# -------- DaVinci Resolve 相关工具函数 --------
+# --- 4.6 打开 Azure 配置窗 ---
+def on_show_azure(ev):
+    azure_config_window.Show()
+win.On.ShowAzure.Clicked = on_show_azure
+
+def on_azure_close(ev):
+    print("Azure API 配置完成")
+    azure_config_window.Hide()
+azure_config_window.On.AzureConfirm.Clicked = on_azure_close
+azure_config_window.On.AzureConfigWin.Close = on_azure_close
+
+def on_azure_register_link_button_clicked(ev):
+    ...
+azure_config_window.On.AzureRegisterButton.Clicked = on_azure_register_link_button_clicked
+
+
+# =============== 5  Resolve 辅助函数 ===============
 def connect_resolve():
     resolve = dvr_script.scriptapp("Resolve")
     project_manager = resolve.GetProjectManager()
     project = project_manager.GetCurrentProject()
-    timeline = project.GetCurrentTimeline()
-    fps = float(project.GetSetting("timelineFrameRate"))
-    return resolve, project, timeline, fps
+    media_pool = project.GetMediaPool(); 
+    root_folder = media_pool.GetRootFolder()
+    timeline      = project.GetCurrentTimeline()
+    fps     = float(project.GetSetting("timelineFrameRate"))
+    return resolve, project, media_pool,root_folder,timeline, fps
 
 def get_subtitles(timeline):
-    subtitles = []
-    track_count = timeline.GetTrackCount("subtitle")
-    for track_idx in range(1, track_count + 1):
-        if not timeline.GetIsTrackEnabled("subtitle", track_idx):
+    subs = []
+    for tidx in range(1, timeline.GetTrackCount("subtitle")+1):
+        if not timeline.GetIsTrackEnabled("subtitle", tidx):
             continue
-        for item in timeline.GetItemListInTrack("subtitle", track_idx):
-            subtitles.append({
-                "start": item.GetStart(),
-                "end"  : item.GetEnd(),
-                "text" : item.GetName()
-            })
-    return subtitles
+        for item in timeline.GetItemListInTrack("subtitle", tidx):
+            subs.append({"start":item.GetStart(),
+                         "end":item.GetEnd(),
+                         "text":item.GetName()})
+    return subs
 
 def frame_to_timecode(frame, fps):
-    total_seconds = frame / fps
-    hours = int(total_seconds // 3600)
-    minutes = int(total_seconds % 3600 // 60)
-    seconds = int(total_seconds % 60)
-    msec    = int((total_seconds % 1) * 1000)
-    return f"{hours:02}:{minutes:02}:{seconds:02},{msec:03}"
+    sec      = frame / fps
+    h, rem   = divmod(sec, 3600)
+    m, rem   = divmod(rem, 60)
+    s, msec  = divmod(rem, 1)
+    return f"{int(h):02}:{int(m):02}:{int(s):02},{int(msec*1000):03}"
 
-def write_srt(subs,start_frame, fps):
-    fd, srt_path = tempfile.mkstemp(suffix=".srt", prefix="translated_")
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        for idx, sub in enumerate(subs, 1):
-            f.write(f"{idx}\n"
-                    f"{frame_to_timecode(sub['start'] - start_frame, fps)} --> {frame_to_timecode(sub['end'] - start_frame, fps)}\n"
-                    f"{sub['text']}\n\n")
-    return srt_path
+def write_srt(subs, start_frame, fps, timeline_name, lang_code, output_dir="."):
+    """
+    按 [时间线名称]_[语言code]_[版本].srt 规则写文件：
+      1. 安全化时间线名称和语言code
+      2. 扫描已有文件，计算新版本号
+      3. 保证 output_dir 存在
+      4. 写入并返回路径
+    """
+    # 1. 安全化名称
+    safe_name = re.sub(r'[\\\/:*?"<>|]', "_", timeline_name)
+    safe_lang = re.sub(r'[\\\/:*?"<>|]', "_", lang_code)
 
-def import_srt_to_first_empty(srt_path: str) -> bool:
-    """把 .srt 导入第一条空字幕轨；若无空轨则新建，并确保 Resolve 真正落到该轨道。"""
-    
-    project = resolve.GetProjectManager().GetCurrentProject()
-    tl      = project.GetCurrentTimeline()
-    if not tl:
-        print("❌ 找不到时间线"); return False
+    # 2. 创建目录（若不存在）
+    os.makedirs(output_dir, exist_ok=True)
 
-    # ---------- 1. 记录并暂时停用已有字幕轨 ----------
-    orig_states = {}
-    for i in range(1, tl.GetTrackCount("subtitle")+1):
-        state = tl.GetIsTrackEnabled("subtitle", i)
-        orig_states[i] = state
-        if state:                              # 只停用启用的轨
-            tl.SetTrackEnable("subtitle", i, False)
+    # 3. 扫描已有版本
+    pattern = re.compile(rf"^{re.escape(safe_name)}_{re.escape(safe_lang)}_(\d+)\.srt$")
+    versions = []
+    for fname in os.listdir(output_dir):
+        m = pattern.match(fname)
+        if m:
+            versions.append(int(m.group(1)))
+    version = max(versions) + 1 if versions else 1
 
-    # ---------- 2. 确保有一条空且启用的字幕轨 ----------
-    target = None
-    for i in range(1, tl.GetTrackCount("subtitle")+1):
-        if not tl.GetItemListInTrack("subtitle", i):
-            target = i
-            break
+    # 4. 构造文件名与路径
+    filename = f"{safe_name}_{safe_lang}_{version}.srt"
+    path = os.path.join(output_dir, filename)
+
+    # 5. 写入 SRT 内容
+    with open(path, "w", encoding="utf-8") as f:
+        for idx, s in enumerate(subs, 1):
+            f.write(
+                f"{idx}\n"
+                f"{frame_to_timecode(s['start']-start_frame, fps)} --> "
+                f"{frame_to_timecode(s['end']  -start_frame, fps)}\n"
+                f"{s['text']}\n\n"
+            )
+
+    return path
+
+def import_srt_to_first_empty(path):
+    resolve, current_project,current_media_pool,current_root_folder, current_timeline, fps = connect_resolve()
+    if not current_timeline: return False
+    # 1. 禁用所有现有字幕轨
+    states = {}
+    for i in range(1, current_timeline.GetTrackCount("subtitle")+1):
+        states[i] = current_timeline.GetIsTrackEnabled("subtitle", i)
+        if states[i]: current_timeline.SetTrackEnable("subtitle", i, False)
+    # 2. 找第一条空轨，没有就新建
+    target = next((i for i in range(1, current_timeline.GetTrackCount("subtitle")+1)
+                   if not current_timeline.GetItemListInTrack("subtitle", i)), None)
     if target is None:
-        tl.AddTrack("subtitle")                # 只能追加，API 不支持插到顶部
-        target = tl.GetTrackCount("subtitle")
-    tl.SetTrackEnable("subtitle", target, True)  # 启用目标轨
-
-    # ---------- 3. 导入 SRT 到媒体池 ----------
-    mp   = project.GetMediaPool()
-    root = mp.GetRootFolder()
-    mp.SetCurrentFolder(root)
-
-    name = os.path.basename(srt_path)
-    # 删除重名条目，避免“链接现有素材”而非导入新素材
-    for clip in root.GetClipList():
-        if clip.GetName() == name:
-            mp.DeleteClips([clip]); break
-
-    imported = mp.ImportMedia([srt_path])
-    if not imported:
-        print("❌ SRT 导入媒体池失败"); return False
-
-    srt_item = imported[0]
-    
-    added_items = mp.AppendToTimeline([srt_item])
-        
-    if not added_items:
-        print("❌ 插入字幕失败");  return False
-
-    target = added_items[0].GetTrackTypeAndIndex()[1]   # 验证落轨
-    print(f"🎉 字幕已落轨 #{target}（目标 {target}） -> {name}")
-
-
+        current_timeline.AddTrack("subtitle")
+        target = current_timeline.GetTrackCount("subtitle")
+    current_timeline.SetTrackEnable("subtitle", target, True)
+    # 3. 导入
+    current_media_pool.SetCurrentFolder(current_root_folder)
+    current_media_pool.ImportMedia([path])
+    current_media_pool.AppendToTimeline([current_root_folder.GetClipList()[-1]])
+    print("🎉 字幕已导入并落在轨道 #", target)
     return True
 
-# -------------------------------------------
-
-# -------------- GPT 调用逻辑 ----------------
-def _build_payload(text,model,target_lang):
-    """构造单行翻译请求 payload"""
-    
-    return {
-        "model": model,
-        "messages": [
-            {
-                "role": "system",
-                "content": (f"You are a translation engine. Translate the user message into "
-                            f"{target_lang}. Return ONLY the translated sentence.")
-            },
-            {"role": "user", "content": text}
-        ],
-        "temperature": 0
-    }
-
-def _translate_line(text,api_key,api_url,model,target_lang):
-    """翻译单行字幕，自动重试"""
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type" : "application/json"
-    }
-    for attempt in range(1, MAX_RETRY + 1):
-        try:
-            resp = requests.post(api_url,
-                                 headers=headers,
-                                 data=json.dumps(_build_payload(text,model,target_lang)),
-                                 timeout=TIMEOUT)
-            
-            # 429/503 也会 raise_for_status
-            resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"].strip()
-        except Exception as e:
-            if attempt == MAX_RETRY:
-                # 最后一次仍失败，直接抛给上层；也可返回原文并记录
-                raise RuntimeError(f"字幕翻译失败：{text[:20]}...") from e
-            time.sleep(2 ** attempt)  # 指数退避
-
-def translate_parallel(text_list,api_key,api_url,model,target_lang):
-    """并发翻译字幕列表，返回相同长度的译文列表"""
-    results = [None] * len(text_list)
+# =============== 6  并发翻译封装 ===============
+def translate_parallel(text_list, provider, target_lang):
+    """provider 为 BaseProvider 子类实例"""
     with concurrent.futures.ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
-        future_to_idx = {pool.submit(_translate_line, txt,api_key,api_url,model,target_lang): idx
-                         for idx, txt in enumerate(text_list)}
-        for future in concurrent.futures.as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            results[idx] = future.result()
-    return results
-# -------------------------------------------
+        futures = {pool.submit(provider.translate, t, target_lang): i
+                   for i,t in enumerate(text_list)}
+        result  = [None]*len(text_list)
+        for f in concurrent.futures.as_completed(futures):
+            idx = futures[f]; result[idx] = f.result()
+    return result
 
-# ------------------- 主流程 -----------------
-    
-def on_trans_button_clicked(ev):
-    
-    resolve, project, timeline, fps = connect_resolve()
-    subs = get_subtitles(timeline)
+# =============== 7  主按钮逻辑 ===============
+def on_trans_clicked(ev):
+    resolve, current_project,current_media_pool, current_root_folder,current_timeline, fps = connect_resolve()
+    subs = get_subtitles(current_timeline)
     if not subs:
         print("❌ 没有找到字幕块"); return
-    
-    all_text = ""
 
-    for index, subtitle in enumerate(subs):
-        start_time = frame_to_timecode(subtitle['start'], fps)
-        end_time = frame_to_timecode(subtitle['end'], fps)
-        all_text += (
-        f"{index + 1}\n"
-        f"{start_time} --> {end_time}\n"
-        f"{subtitle['text']}\n\n"
+    # 把原字幕显示在 TextEdit 里
+    items["SubTxt"].Text = "\n\n".join(
+        f"{i+1}\n{frame_to_timecode(s['start'],fps)} --> {frame_to_timecode(s['end'],fps)}\n{s['text']}"
+        for i,s in enumerate(subs)
     )
-    
-    items["SubTxt"].Text = all_text
 
-    # 1. 抽取原文
-    ori_texts = [s["text"] for s in subs]
+    # 取 GUI 参数
+    provider_name = items["ProviderCombo"].CurrentText
+    provider      = prov_manager.get(provider_name)
+    target_lang_name = items["TargetLangCombo"].CurrentText        # 例：中文（普通话）
+    target_lang_code = LANG_CODE_MAP[target_lang_name]             # 例：zh-Hans
 
-    # 2. 并发翻译
-    api_key  = openai_items["OpenAIApiKey"].Text
-    api_url = f"{openai_items["OpenAIBaseURL"].Text.strip('/')}/v1/chat/completions"
-    model = items["OpenAIModelCombo"].CurrentText
-    target_lang = items["TargetLangCombo"].CurrentText
-    print("api_url:",api_url)
-    print("api_key:",api_key)
-    print("model:",model)
-    print("target_lang:",target_lang)
-    print(f"开始并发翻译，共 {len(ori_texts)} 行，线程数 {CONCURRENCY} …")
-    trans_texts = translate_parallel(ori_texts,api_key,api_url,model,target_lang)
 
-    # 3. 写回字幕对象
-    for sub, new_txt in zip(subs, trans_texts):
-        sub["text"] = new_txt
+    # 如果用户在 GUI 修改了 key/url/model，则写回 provider.cfg
+    if provider_name == "openai":
+        # 与原逻辑一致
+        provider.cfg["api_key"]  = openai_items["OpenAIApiKey"].Text or provider.cfg["api_key"]
+        provider.cfg["base_url"] = openai_items["OpenAIBaseURL"].Text or provider.cfg["base_url"]
+        provider.cfg["model"]    = openai_items["OpenAIModelCombo"].CurrentText or provider.cfg["model"]
+        lang_for_provider = target_lang_name             # OpenAI 使用自然语言名称
+    elif provider_name == "azure":
+        provider.cfg["api_key"]  = azure_items["AzureApiKey"].Text or AZURE_DEFAULT_KEY
+        provider.cfg["region"]   = azure_items["AzureRegion"].Text or AZURE_DEFAULT_REGION
+        lang_for_provider = LANG_CODE_MAP[target_lang_name]  # Azure 用 zh-Hans / en 等
+    elif provider_name == "google":
+        lang_for_provider = GOOGLE_LANG_CODE_MAP[target_lang_name]  # Google 用 zh-cn / en 等
+    else:
+        raise ValueError(f"未知服务商: {provider_name}")
 
-    # 4. 生成 SRT
-    start_frame = timeline.GetStartFrame()
-    srt_path = write_srt(subs, start_frame,fps)
-    print("✅ 翻译完成！SRT 文件路径：", srt_path)
+    print(f"➡️ 使用 {provider_name} 翻译 {len(subs)} 行…")
+    ori_texts   = [s["text"] for s in subs]
+    trans_texts = translate_parallel(ori_texts, provider, lang_for_provider)
 
-    if srt_path :
-        import_srt_to_first_empty(srt_path)
+    for s, new in zip(subs, trans_texts):
+        s["text"] = new
 
-win.On.TransButton.Clicked = on_trans_button_clicked
+    output_dir = os.path.join(script_path, 'srt')
 
+    srt_path = write_srt(
+        subs,
+        current_timeline.GetStartFrame(),
+        fps,
+        current_timeline.GetName(),
+        target_lang_code,  # 你之前得出的 target_lang_code
+        output_dir=output_dir
+    )
+    print("✅ 翻译完成，SRT 路径：", srt_path)
+
+    # 4. 导入并判断是否成功
+    succeed = import_srt_to_first_empty(srt_path)
+
+    # 5. 如果成功，就删除本地 .srt
+    if succeed:
+        try:
+            os.remove(srt_path)
+            print(f"🗑 本地文件已删除：{srt_path}")
+        except Exception as e:
+            print("⚠️ 删除本地 SRT 时出错：", e)
+
+win.On.TransButton.Clicked = on_trans_clicked
+
+# =============== 8  关闭窗口保存设置 ===============
 def on_close(ev):
     close_and_save(settings_file)
     dispatcher.ExitLoop()
 win.On.MyWin.Close = on_close
 
-
-win.Show()
-dispatcher.RunLoop()
-win.Hide()
+# =============== 9  运行 GUI ===============
+win.Show(); 
+dispatcher.RunLoop(); 
+win.Hide(); 
 openai_config_window.Hide()
+azure_config_window.Hide()
