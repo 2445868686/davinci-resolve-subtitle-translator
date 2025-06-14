@@ -208,7 +208,7 @@ track_counts  = ["1","2","3","4","5"]
 for track in track_counts:
     items["TrackCombo"].AddItem(track)
 
-openai_models = ["gpt-4o-mini","gpt-4o-mini","gpt-4.1-nano","gpt-4.1",]
+openai_models = ["gpt-4o-mini","gpt-4o","gpt-4.1-nano","gpt-4.1",]
 for model in openai_models:
     items["OpenAIModelCombo"].AddItem(model)
 
@@ -378,22 +378,76 @@ def frame_to_timecode(frame, fps):
     msec    = int((total_seconds % 1) * 1000)
     return f"{hours:02}:{minutes:02}:{seconds:02},{msec:03}"
 
-def write_srt(subs, fps):
+def write_srt(subs,start_frame, fps):
     fd, srt_path = tempfile.mkstemp(suffix=".srt", prefix="translated_")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         for idx, sub in enumerate(subs, 1):
             f.write(f"{idx}\n"
-                    f"{frame_to_timecode(sub['start'], fps)} --> {frame_to_timecode(sub['end'], fps)}\n"
+                    f"{frame_to_timecode(sub['start'] - start_frame, fps)} --> {frame_to_timecode(sub['end'] - start_frame, fps)}\n"
                     f"{sub['text']}\n\n")
     return srt_path
+
+def import_srt_to_first_empty(srt_path: str) -> bool:
+    """把 .srt 导入第一条空字幕轨；若无空轨则新建，并确保 Resolve 真正落到该轨道。"""
+    
+    project = resolve.GetProjectManager().GetCurrentProject()
+    tl      = project.GetCurrentTimeline()
+    if not tl:
+        print("❌ 找不到时间线"); return False
+
+    # ---------- 1. 记录并暂时停用已有字幕轨 ----------
+    orig_states = {}
+    for i in range(1, tl.GetTrackCount("subtitle")+1):
+        state = tl.GetIsTrackEnabled("subtitle", i)
+        orig_states[i] = state
+        if state:                              # 只停用启用的轨
+            tl.SetTrackEnable("subtitle", i, False)
+
+    # ---------- 2. 确保有一条空且启用的字幕轨 ----------
+    target = None
+    for i in range(1, tl.GetTrackCount("subtitle")+1):
+        if not tl.GetItemListInTrack("subtitle", i):
+            target = i
+            break
+    if target is None:
+        tl.AddTrack("subtitle")                # 只能追加，API 不支持插到顶部
+        target = tl.GetTrackCount("subtitle")
+    tl.SetTrackEnable("subtitle", target, True)  # 启用目标轨
+
+    # ---------- 3. 导入 SRT 到媒体池 ----------
+    mp   = project.GetMediaPool()
+    root = mp.GetRootFolder()
+    mp.SetCurrentFolder(root)
+
+    name = os.path.basename(srt_path)
+    # 删除重名条目，避免“链接现有素材”而非导入新素材
+    for clip in root.GetClipList():
+        if clip.GetName() == name:
+            mp.DeleteClips([clip]); break
+
+    imported = mp.ImportMedia([srt_path])
+    if not imported:
+        print("❌ SRT 导入媒体池失败"); return False
+
+    srt_item = imported[0]
+    
+    added_items = mp.AppendToTimeline([srt_item])
+        
+    if not added_items:
+        print("❌ 插入字幕失败");  return False
+
+    target = added_items[0].GetTrackTypeAndIndex()[1]   # 验证落轨
+    print(f"🎉 字幕已落轨 #{target}（目标 {target}） -> {name}")
+
+
+    return True
 
 # -------------------------------------------
 
 # -------------- GPT 调用逻辑 ----------------
-def _build_payload(text):
+def _build_payload(text,model,target_lang):
     """构造单行翻译请求 payload"""
-    model = items["OpenAIModelCombo"].CurrentText
-    target_lang = items["TargetLangCombo"].CurrentIndex
+    
     return {
         "model": model,
         "messages": [
@@ -407,10 +461,8 @@ def _build_payload(text):
         "temperature": 0
     }
 
-def _translate_line(text):
+def _translate_line(text,api_key,api_url,model,target_lang):
     """翻译单行字幕，自动重试"""
-    api_key  = openai_items["OpenAIApiKey"].Text
-    api_url = f"{openai_items["OpenAIBaseURL"].Text.strip('/')}/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type" : "application/json"
@@ -419,8 +471,9 @@ def _translate_line(text):
         try:
             resp = requests.post(api_url,
                                  headers=headers,
-                                 data=json.dumps(_build_payload(text)),
+                                 data=json.dumps(_build_payload(text,model,target_lang)),
                                  timeout=TIMEOUT)
+            
             # 429/503 也会 raise_for_status
             resp.raise_for_status()
             return resp.json()["choices"][0]["message"]["content"].strip()
@@ -430,11 +483,11 @@ def _translate_line(text):
                 raise RuntimeError(f"字幕翻译失败：{text[:20]}...") from e
             time.sleep(2 ** attempt)  # 指数退避
 
-def translate_parallel(text_list):
+def translate_parallel(text_list,api_key,api_url,model,target_lang):
     """并发翻译字幕列表，返回相同长度的译文列表"""
     results = [None] * len(text_list)
     with concurrent.futures.ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
-        future_to_idx = {pool.submit(_translate_line, txt): idx
+        future_to_idx = {pool.submit(_translate_line, txt,api_key,api_url,model,target_lang): idx
                          for idx, txt in enumerate(text_list)}
         for future in concurrent.futures.as_completed(future_to_idx):
             idx = future_to_idx[future]
@@ -443,35 +496,6 @@ def translate_parallel(text_list):
 # -------------------------------------------
 
 # ------------------- 主流程 -----------------
-def main():
-    resolve, project, timeline, fps = connect_resolve()
-    subs = get_subtitles(timeline)
-    if not subs:
-        print("❌ 没有找到字幕块"); return
-
-    # 1. 抽取原文
-    ori_texts = [s["text"] for s in subs]
-
-    # 2. 并发翻译
-    print(f"开始并发翻译，共 {len(ori_texts)} 行，线程数 {CONCURRENCY} …")
-    trans_texts = translate_parallel(ori_texts)
-
-    # 3. 写回字幕对象
-    for sub, new_txt in zip(subs, trans_texts):
-        sub["text"] = new_txt
-
-    # 4. 生成 SRT
-    srt_path = write_srt(subs, fps)
-    print("✅ 翻译完成！SRT 文件路径：", srt_path)
-
-    #5. （可选）导入时间线
-    media_pool = project.GetMediaPool()
-    mp_items   = media_pool.ImportMedia([srt_path])
-    if mp_items:
-         timeline.AppendToTimeline(mp_items)
-         print("✅ 已把字幕添加到时间线")
-    else:
-         print("❌ SRT 导入失败")
     
 def on_trans_button_clicked(ev):
     
@@ -497,16 +521,28 @@ def on_trans_button_clicked(ev):
     ori_texts = [s["text"] for s in subs]
 
     # 2. 并发翻译
+    api_key  = openai_items["OpenAIApiKey"].Text
+    api_url = f"{openai_items["OpenAIBaseURL"].Text.strip('/')}/v1/chat/completions"
+    model = items["OpenAIModelCombo"].CurrentText
+    target_lang = items["TargetLangCombo"].CurrentText
+    print("api_url:",api_url)
+    print("api_key:",api_key)
+    print("model:",model)
+    print("target_lang:",target_lang)
     print(f"开始并发翻译，共 {len(ori_texts)} 行，线程数 {CONCURRENCY} …")
-    trans_texts = translate_parallel(ori_texts)
+    trans_texts = translate_parallel(ori_texts,api_key,api_url,model,target_lang)
 
     # 3. 写回字幕对象
     for sub, new_txt in zip(subs, trans_texts):
         sub["text"] = new_txt
 
     # 4. 生成 SRT
-    srt_path = write_srt(subs, fps)
+    start_frame = timeline.GetStartFrame()
+    srt_path = write_srt(subs, start_frame,fps)
     print("✅ 翻译完成！SRT 文件路径：", srt_path)
+
+    if srt_path :
+        import_srt_to_first_empty(srt_path)
 
 win.On.TransButton.Clicked = on_trans_button_clicked
 
