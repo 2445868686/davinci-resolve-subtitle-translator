@@ -3,8 +3,27 @@
 """
 读取字幕 → 逐行并发 GPT 翻译 → 生成译文 SRT
 """
+# ================= 用户配置 =================
+SCRIPT_NAME = "DaVinci TTS "
+SCRIPT_VERSION = "3.3"
+SCRIPT_AUTHOR = "HEIBA"
+SCREEN_WIDTH = 1920
+SCREEN_HEIGHT = 1080
+WINDOW_WIDTH = 400 
+WINDOW_HEIGHT = 500
+X_CENTER = (SCREEN_WIDTH - WINDOW_WIDTH) // 2
+Y_CENTER = (SCREEN_HEIGHT - WINDOW_HEIGHT) // 2
+SCRIPT_KOFI_URL="https://ko-fi.com/heiba"
+SCRIPT_WX_URL = "https://mp.weixin.qq.com/s?__biz=MzUzMTk2MDU5Nw==&mid=2247484626&idx=1&sn=e5eef7e48fbfbf37f208ed9a26c5475a&chksm=fabbc2a8cdcc4bbefcb7f6c72a3754335c25ec9c3e408553ec81c009531732e82cbab923276c#rd"
+OPENAI_API_KEY = "sk-wLP8n2FczZrYukonSvbozSba4HyV4cBHstEPDACv8aeI6QFH"
+OPENAI_API_URL = "https://yunwu.ai/"
+CONCURRENCY    = 10               # 并发线程数（5~10 较稳）
+MAX_RETRY      = 3               # 单行最多重试次数
+TIMEOUT        = 30              # 单次请求超时（秒）
+# ===========================================
 
 import os, sys, json, time, tempfile, platform, requests, concurrent.futures
+from functools import partial
 # 1. 获取脚本所在目录（备用）
 script_path = os.path.dirname(os.path.abspath(sys.argv[0]))
 config_dir = os.path.join(script_path, 'config')
@@ -44,8 +63,8 @@ dispatcher = bmd.UIDispatcher(ui)
 win = dispatcher.AddWindow(
     {
         "ID": 'MyWin',
-        "WindowTitle": '字幕翻译',
-        "Geometry": [700, 300, 400, 480],
+        "WindowTitle": SCRIPT_NAME+SCRIPT_VERSION, 
+        "Geometry": [X_CENTER, Y_CENTER, WINDOW_WIDTH, WINDOW_HEIGHT],
         "Spacing": 10,
         "StyleSheet": """
         * {
@@ -63,54 +82,15 @@ win = dispatcher.AddWindow(
                         ui.VGroup(
                             {"Weight": 1},
                             [
-                                ui.HGroup(
-                                    {"Weight": 0.1},
-                                    [
-                                        ui.Label({"ID": 'TrackLabel', "Text": '翻译轨道', "Alignment": {"AlignRight": False}, "Weight": 0.2}),
-                                        
-                                    ]
-                                ),
-                                ui.HGroup(
-                                    {"Weight": 0.1},
-                                    [
-                                        
-                                        ui.ComboBox({"ID": 'TrackCombo', "Text": '', "Weight": 0.8}),
-                                    ]
-                                ),
-                                ui.HGroup(
-                                    {"Weight": 0.1},
-                                    [
-                                        ui.Label({"ID": 'OpenAIModelLabel', "Text": '模型', "Alignment": {"AlignRight": False}, "Weight": 0.2}),
-                                        
-                                    ]
-                                ),
-                                ui.HGroup(
-                                    {"Weight": 0.1},
-                                    [
-                        
-                                        ui.ComboBox({"ID": 'OpenAIModelCombo', "Text": '', "Weight": 0.8}),
-                                    ]
-                                ),
-                                ui.HGroup(
-                                    {"Weight": 0.1},
-                                    [
-                                        ui.Label({"ID": 'TargetLangLabel', "Text": '目标语言', "Alignment": {"AlignRight": False}, "Weight": 0.2}),
-                                        
-                                    ]
-                                ),
-                                ui.HGroup(
-                                    {"Weight": 0.1},
-                                    [
+                                ui.TextEdit({"ID": "SubTxt", "Text": "", "ReadOnly": False, "Font": ui.Font({"PixelSize": 14}),"Weight": 1}),
+                                ui.Label({"ID": 'TrackLabel', "Text": '翻译轨道', "Alignment": {"AlignRight": False}, "Weight": 0.1}),
+                                ui.ComboBox({"ID": 'TrackCombo', "Text": '', "Weight": 0.1}),
+                                ui.Label({"ID": 'OpenAIModelLabel', "Text": '模型', "Alignment": {"AlignRight": False}, "Weight": 0.1}),
+                                ui.ComboBox({"ID": 'OpenAIModelCombo', "Text": '', "Weight": 0.1}),
+                                ui.Label({"ID": 'TargetLangLabel', "Text": '目标语言', "Alignment": {"AlignRight": False}, "Weight": 0.1}),
+                                ui.ComboBox({"ID": 'TargetLangCombo', "Text": '', "Weight": 0.1}),
+                                ui.Button({"ID": 'TransButton', "Text": '翻译',"Weight": 0.1}),
                                 
-                                        ui.ComboBox({"ID": 'TargetLangCombo', "Text": '', "Weight": 0.8}),
-                                    ]
-                                ),
-                                ui.HGroup(
-                                    {"Weight": 0.1},
-                                    [
-                                        ui.Button({"ID": 'GenerateButton', "Text": '生成'}),
-                                    ]
-                                ),
                             ]
                             
 
@@ -124,11 +104,12 @@ win = dispatcher.AddWindow(
                                 
                                 ]
                                 ),
-                                ui.HGroup({"Weight": 1}, [
+                                ui.HGroup({"Weight": 0.1}, [
                                 ui.CheckBox({"ID": "LangEnCheckBox", "Text": "EN", "Checked": True, "Alignment": {"AlignRight": True}, "Weight": 0}),
                                 ui.CheckBox({"ID": "LangCnCheckBox", "Text": "简体中文", "Checked": False, "Alignment": {"AlignRight": True}, "Weight": 1}),
-                            
-                        ]),
+                                
+                                ]),
+                                ui.TextEdit({"ID": "infoTxt", "Text": "", "ReadOnly": True, "Font": ui.Font({"PixelSize": 14}),"Weight": 1})
                             ]
                             
                         ),
@@ -179,12 +160,14 @@ openai_config_window = dispatcher.AddWindow(
         )
     ]
 )
+
 translations = {
     "cn": {
         "Tabs": ["翻译","配置"],
         "OpenAIModelLabel":"模型：",
         "TrackLabel":"翻译轨道：",
         "TargetLangLabel":"目标语音：",
+        "TransButton":"开始翻译",
         "ShowOpenAI": "配置",
         "OpenAILabel":"填写OpenAI API信息",
         "OpenAIBaseURLLabel":"Base URL",
@@ -199,6 +182,7 @@ translations = {
         "OpenAIModelLabel":"Model:",
         "TrackLabel":"Translate Track:",
         "TargetLangLabel":"Target Language:",
+        "TransButton":"Translate",
         "ShowOpenAI": "Config",
         "OpenAILabel":"OpenAI API",
         "OpenAIBaseURLLabel":"Base URL",
@@ -208,6 +192,7 @@ translations = {
         
     }
 }    
+
 items = win.GetItems()
 openai_items = openai_config_window.GetItems()
 items["MyStack"].CurrentIndex = 0
@@ -266,10 +251,10 @@ def load_settings(settings_file):
     return None
 
 default_settings = {
-    "OpenAI_API_KEY": "",
-    "OpenAI_BASE_URL": "",
-    "OpenAI_Model": 0,
-    "OpenAI_Voice": 0,
+    "OPENAI_API_KEY": "",
+    "OPENAI_BASE_URL": "",
+    "OPENAI_MODEL": 0,
+    "TARGET_LANG":0,
     "CN":True,
     "EN":False,
 }
@@ -283,14 +268,17 @@ def close_and_save(settings_file):
         "CN":items["LangCnCheckBox"].Checked,
         "EN":items["LangEnCheckBox"].Checked,
         
-        "OpenAI_API_KEY": openai_items["OpenAIApiKey"].Text,
-        "OpenAI_BASE_URL": openai_items["OpenAIBaseURL"].Text,
-        "OpenAI_Model": items["OpenAIModelCombo"].CurrentIndex,
+        "OPENAI_API_KEY": openai_items["OpenAIApiKey"].Text,
+        "OPENAI_BASE_URL": openai_items["OpenAIBaseURL"].Text,
+        "OPENAI_MODEL": items["OpenAIModelCombo"].CurrentIndex,
+        "TARGET_LANG":items["TargetLangCombo"].CurrentIndex,
+
 
         
     }
 
     save_settings(settings, settings_file)
+
 def switch_language(lang):
     """
     根据 lang (可取 'cn' 或 'en') 切换所有控件的文本
@@ -334,6 +322,21 @@ def on_en_checkbox_clicked(ev):
         print("cn")
         switch_language("cn")
 win.On.LangEnCheckBox.Clicked = on_en_checkbox_clicked
+
+
+if saved_settings:
+    items["OpenAIModelCombo"].CurrentIndex = saved_settings.get("OPENAI_MODEL", default_settings["OPENAI_MODEL"])
+    items["TargetLangCombo"].CurrentIndex = saved_settings.get("TARGET_LANG", default_settings["TARGET_LANG"])
+    items["LangCnCheckBox"].Checked = saved_settings.get("CN", default_settings["CN"])
+    items["LangEnCheckBox"].Checked = saved_settings.get("EN", default_settings["EN"])
+    openai_items["OpenAIApiKey"].Text = saved_settings.get("OPENAI_API_KEY", default_settings["OPENAI_API_KEY"])
+    openai_items["OpenAIBaseURL"].Text = saved_settings.get("OPENAI_BASE_URL", default_settings["OPENAI_BASE_URL"])    
+
+if items["LangEnCheckBox"].Checked :
+    switch_language("en")
+else:
+    switch_language("cn")
+
 def on_openai_close(ev):
     print("OpenAI API 配置完成")
     openai_config_window.Hide()
@@ -343,15 +346,6 @@ openai_config_window.On.OpenAIConfigWin.Close = on_openai_close
 def on_show_openai(ev):
     openai_config_window.Show()
 win.On.ShowOpenAI.Clicked = on_show_openai
-# ================= 用户配置 =================
-OPENAI_API_KEY = "sk-wLP8n2FczZrYukonSvbozSba4HyV4cBHstEPDACv8aeI6QFH"
-OPENAI_API_URL = "https://yunwu.ai/"
-OPENAI_MODEL   = "gpt-4o"
-TARGET_LANG    = "English"       # 目标语言
-CONCURRENCY    = 10               # 并发线程数（5~10 较稳）
-MAX_RETRY      = 3               # 单行最多重试次数
-TIMEOUT        = 30              # 单次请求超时（秒）
-# ===========================================
 
 # -------- DaVinci Resolve 相关工具函数 --------
 def connect_resolve():
@@ -392,18 +386,21 @@ def write_srt(subs, fps):
                     f"{frame_to_timecode(sub['start'], fps)} --> {frame_to_timecode(sub['end'], fps)}\n"
                     f"{sub['text']}\n\n")
     return srt_path
+
 # -------------------------------------------
 
 # -------------- GPT 调用逻辑 ----------------
 def _build_payload(text):
     """构造单行翻译请求 payload"""
+    model = items["OpenAIModelCombo"].CurrentText
+    target_lang = items["TargetLangCombo"].CurrentIndex
     return {
-        "model": OPENAI_MODEL,
+        "model": model,
         "messages": [
             {
                 "role": "system",
                 "content": (f"You are a translation engine. Translate the user message into "
-                            f"{TARGET_LANG}. Return ONLY the translated sentence.")
+                            f"{target_lang}. Return ONLY the translated sentence.")
             },
             {"role": "user", "content": text}
         ],
@@ -412,9 +409,10 @@ def _build_payload(text):
 
 def _translate_line(text):
     """翻译单行字幕，自动重试"""
-    api_url = f"{OPENAI_API_URL.strip('/')}/v1/chat/completions"
+    api_key  = openai_items["OpenAIApiKey"].Text
+    api_url = f"{openai_items["OpenAIBaseURL"].Text.strip('/')}/v1/chat/completions"
     headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type" : "application/json"
     }
     for attempt in range(1, MAX_RETRY + 1):
@@ -474,6 +472,43 @@ def main():
          print("✅ 已把字幕添加到时间线")
     else:
          print("❌ SRT 导入失败")
+    
+def on_trans_button_clicked(ev):
+    
+    resolve, project, timeline, fps = connect_resolve()
+    subs = get_subtitles(timeline)
+    if not subs:
+        print("❌ 没有找到字幕块"); return
+    
+    all_text = ""
+
+    for index, subtitle in enumerate(subs):
+        start_time = frame_to_timecode(subtitle['start'], fps)
+        end_time = frame_to_timecode(subtitle['end'], fps)
+        all_text += (
+        f"{index + 1}\n"
+        f"{start_time} --> {end_time}\n"
+        f"{subtitle['text']}\n\n"
+    )
+    
+    items["SubTxt"].Text = all_text
+
+    # 1. 抽取原文
+    ori_texts = [s["text"] for s in subs]
+
+    # 2. 并发翻译
+    print(f"开始并发翻译，共 {len(ori_texts)} 行，线程数 {CONCURRENCY} …")
+    trans_texts = translate_parallel(ori_texts)
+
+    # 3. 写回字幕对象
+    for sub, new_txt in zip(subs, trans_texts):
+        sub["text"] = new_txt
+
+    # 4. 生成 SRT
+    srt_path = write_srt(subs, fps)
+    print("✅ 翻译完成！SRT 文件路径：", srt_path)
+
+win.On.TransButton.Clicked = on_trans_button_clicked
 
 def on_close(ev):
     close_and_save(settings_file)
